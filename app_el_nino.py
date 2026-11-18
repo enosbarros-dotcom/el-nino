@@ -157,6 +157,15 @@ def responder(pergunta: str, f: dict) -> str:
             "Experimente: *\"Quando a anomalia foi confirmada?\"* ou *\"Quais estados mais impactados?\"*"
         )
 
+    # metricas e modelagem (antes da definicao generica, para "o que e o indice de impacto?")
+    if any(t in q for t in ["indice de impacto", "indice impacto", "o que e indice",
+                            "como e calculado", "como funciona", "modelo", "modelagem",
+                            "z-score", "z score", "z_",
+                            "calor_z", "seca_z", "chuva_z", "frac_quente", "frac_calor",
+                            "padroniza", "normaliz", "climatolog", "desvio padrao",
+                            "metodologia", "metodo de calculo"]):
+        return _resposta_metricas(f)
+
     if "o que e" in q or "explica" in q and "nino" in q or ("el nino" in q and "que" in q and "?" in pergunta):
         return (
             "**El Nino** e um fenomeno climatico natural caracterizado pelo aquecimento anormal das "
@@ -270,6 +279,48 @@ def _ficha_regiao(reg: str, ranking: list[dict], f: dict) -> str:
         f"**Orientacoes:** "
         + (KB_CHUVA if reg == "S" else KB_SECA if reg in ("N", "NE") else KB_SAUDE_CALOR)
         + f"\n\n{EMERGENCIAS}"
+    )
+
+
+def _resposta_metricas(f: dict) -> str:
+    """Explica a modelagem de dados: z-score, indice de impacto e criterio de confirmacao."""
+    zc = f["z_calor_conf"]
+    zl = f["z_limiar"]
+    perfil = (
+        "O indice usa um **perfil regional** (sinal do efeito esperado do El Nino):\n"
+        "- Sul: chuva (+1), calor (0,4)\n"
+        "- Norte/Nordeste: seca (+1), calor (0,6)\n"
+        "- Centro-Oeste/Sudeste: calor (+1), seca (0,2-0,3)\n"
+        "Assim, um estado do Sul com excesso de chuva pontua mais que um com seca, "
+        "e um do Nordeste com seca pontua mais que um com excesso de chuva."
+    )
+    return (
+        f"**Como os dados sao modelados**\n\n"
+        f"**1. Z-score (anomalia padronizada)**\n"
+        f"Cada estacao tem sua propria climatologia por mes-do-ano. A anomalia de cada mes e "
+        f"`(valor observado - media do mes) / desvio-padrao da estacao`. Resultado: "
+        f"quantos sigmas (desvios-padrao) o mes ficou acima ou abaixo do normal.\n"
+        f"- z > 0: acima da media; z < 0: abaixo.\n"
+        f"- `z_limiar = {zl}` marca mes anomalo (calor/seca/chuva extremos).\n"
+        f"- `z_calor_conf = {zc}` e o corte usado na confirmacao nacional.\n\n"
+        f"**2. Confirmacao da anomalia**\n"
+        f"Sinal amplo e sustentado: `temp_z medio >= {zc}` **e** pelo menos "
+        f"`{f['frac_conf']*100:.0f}%` das estacoes com z >= {zc} no mesmo mes.\n\n"
+        f"**3. Indice de impacto por UF**\n"
+        f"Score ponderado que combina as anomalias com o efeito esperado do El Nino na regiao:\n"
+        f"`indice = perfil.calor * calor_z + perfil.seca * seca_z + perfil.chuva * chuva_z`\n"
+        f"- **calor_z**: media dos z de temperatura positivos (apenas calor).\n"
+        f"- **seca_z**: media dos z de precipitacao negativos virados para positivo (deficit).\n"
+        f"- **chuva_z**: media dos z de precipitacao positivos (excesso).\n\n"
+        f"{perfil}\n\n"
+        f"**4. Variaveis de suporte**\n"
+        f"- `perc_meses_quentes/seco/umidos`: % dos meses com z acima/abaixo do limiar.\n"
+        f"- `dias_calor_extremo`: dias com Tmax >= 35 C.\n"
+        f"- `dias_chuva_intensa`: dias com precip >= 50 mm.\n"
+        f"- `frac_quente`: fracao das estacoes com z >= {zc} no mes.\n\n"
+        f"Periodo analisado: {f['periodo_dados']['min']} a {f['periodo_dados']['max']} "
+        f"({f['n_estacoes']} estacoes, {f['n_ufs']} UFs). Nao e previsao meteorologica: "
+        f"e uma leitura dos dados observados do INMET."
     )
 
 
@@ -410,7 +461,7 @@ def main() -> None:
             "Quando a anomalia foi confirmada?",
             "Quais estados serao mais impactados?",
             "Quais os impactos no Nordeste?",
-            "Orientacoes para onda de calor",
+            "O que e o indice de impacto?",
         ]
         for inicio in range(0, len(sugestoes), 2):
             for col, s in zip(st.columns(2), sugestoes[inicio:inicio + 2]):
