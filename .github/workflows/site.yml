@@ -52,7 +52,18 @@ jobs:
           cp relatorio_el_nino.html dist/index.html
           cp favicon.svg dist/favicon.svg
 
-      # 4) O Blob Storage tambem hospeda o favicon; a flag abaixo evita erro de
+      # 4) Habilita o static website (idempotente). O Bicep nao gerencia essa
+      #    configuracao porque o nome das sub-propriedades varia entre api-versions.
+      - name: Habilitar static website
+        run: |
+          az storage account blob-service-properties update \
+            --resource-group ${{ vars.AZURE_RG }} \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --enable-static-website \
+            --index-document index.html \
+            --404-document index.html
+
+      # 5) O Blob Storage tambem hospeda o favicon; a flag abaixo evita erro de
       #    content-type no SVG, que o upload-batch nao detecta sozinho.
       - name: Publicar no static website
         run: |
