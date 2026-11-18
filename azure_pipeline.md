@@ -17,12 +17,14 @@ O projeto tem **duas cargas com naturezas opostas**, e é isso que define a arqu
 
 **Arquitetura escolhida:**
 
-- **Azure Static Web Apps (Free)** → hospeda o relatório (CDN global, HTTPS e domínio próprio gratuitos).
+- **Azure Blob Storage — static website** → hospeda o relatório (HTTPS, endpoint `*.web.core.windows.net`).
 - **Azure Container Apps (Consumption, `minReplicas: 0`)** → hospeda o agente, com **escala para zero**.
 - **GitHub Container Registry (público)** → registra a imagem, evitando o custo do Azure Container Registry.
 - **GitHub Actions + Bicep** → CI/CD e infraestrutura como código.
 
 **Custo estimado em regime de baixo tráfego: ≈ US$ 0/mês** (dentro das franquias gratuitas).
+
+> **Restrição da assinatura (Azure for Students):** uma política da assinatura limita o deploy a um conjunto fixo de regiões — `eastus`, `canadacentral`, `chilecentral`, `mexicocentral` e `brazilsouth`. O **Static Web Apps não existe em nenhuma delas**, então o relatório é servido por um **static website do Blob Storage** (disponível em todas as regiões). Todo o deploy usa **brazilsouth**.
 
 ---
 
@@ -38,18 +40,18 @@ flowchart LR
     end
 
     build --> ghcr[(GHCR<br/>imagem :sha)]
-    gha --> infra[Deploy Bicep<br/>Container Apps + SWA]
+    gha --> infra[Deploy Bicep<br/>Container Apps + Storage]
 
     infra --> caa[Container App<br/>agente Streamlit]
     ghcr --> caa
 
     infra --> fqdn[Ler FQDN do agente]
     fqdn --> gen
-    gen --> swa[Static Web App<br/>relatório]
+    gen --> blob[Blob Storage<br/>static website]
 
-    caa -. iframe .-> swa
-    user([Usuário]) --> swa
-    swa -. painel lateral .-> caa
+    caa -. iframe .-> blob
+    user([Usuário]) --> blob
+    blob -. painel lateral .-> caa
 ```
 
 **Ordem de dependência crítica:** o relatório precisa da URL pública do agente *antes* de ser gerado (ela entra no `<iframe>`). Por isso o job do site lê o FQDN via `az containerapp show` e injeta em `ELNINO_AGENT_URL`.
@@ -64,17 +66,17 @@ flowchart TD
         u([Navegador do usuário])
     end
 
-    subgraph azure["Assinatura Azure · Resource Group rg-el-nino"]
-        subgraph swaRes["Static Web App (Free)"]
+    subgraph azure["Assinatura Azure · Resource Group rg-el-nino · brazilsouth"]
+        subgraph blobRes["Blob Storage · static website"]
             html["index.html<br/>favicon.svg"]
         end
         subgraph caRes["Container Apps Environment (Consumption)"]
-            replica["Réplica 0..2<br/>0.5 vCPU · 1 GiB<br/>Streamlit :8501"]
+            replica["Réplica 0..1<br/>0.5 vCPU · 1 GiB<br/>Streamlit :8501"]
         end
         la["Log Analytics<br/>retenção 30 dias"]
     end
 
-    u -->|HTTPS · CDN| html
+    u -->|HTTPS| html
     html -->|iframe| replica
     replica -->|stdout/stderr| la
 ```
@@ -89,6 +91,7 @@ Sem VNet, sem banco, sem chaves de API: o agente é **100% offline** e a única 
 
 | Serviço | Custo aproximado | Motivo da recusa |
 |---|---|---|
+| **Azure Static Web Apps (Free)** | US$ 0 | Bloqueado pela política de regiões da assinatura (não existe em `brazilsouth` nem nas demais regiões permitidas) |
 | **AKS** | US$ 70+/mês (nó mínimo) | Orquestração de cluster é desproporcional a 1 container |
 | **App Service B1** | ~US$ 13/mês sempre ligado | Cobra 24/7 mesmo com acesso esporádico |
 | **App Service F1 (Free)** | US$ 0 | Sem domínio próprio/SSL e limite de 60 min de CPU/dia |
@@ -114,7 +117,7 @@ Sem VNet, sem banco, sem chaves de API: o agente é **100% offline** e a única 
 | Container Apps — memória | 360.000 GiB-segundos |
 | Container Apps — requisições | 2 milhões |
 | Log Analytics | 5 GB de ingestão |
-| Static Web Apps (plano Free) | 100 GB de banda, SSL e domínio próprio |
+| Blob Storage LRS (static website) | cobrança por GB armazenado/transferido — centavos para este volume |
 | GHCR (repositório público) | Ilimitado |
 
 ---
@@ -232,8 +235,15 @@ targetScope = 'resourceGroup'
 @description('Prefixo dos nomes dos recursos')
 param prefix string = 'elnino'
 
-@description('Região. eastus2 = menor custo; brazilsouth = menor latência')
-param location string = 'eastus2'
+@description('Região. Restrita pela política da assinatura (ver seção 1)')
+@allowed([
+  'eastus'
+  'canadacentral'
+  'chilecentral'
+  'mexicocentral'
+  'brazilsouth'
+])
+param location string = 'brazilsouth'
 
 @description('Imagem do agente no registry')
 param image string = 'ghcr.io/SEU_USUARIO/el-nino-agent:latest'
@@ -244,8 +254,8 @@ param cpu string = '0.5'
 @description('Memória por réplica (precisa casar com a vCPU)')
 param memory string = '1Gi'
 
-@description('Nome do Static Web App (precisa ser globalmente único na Azure)')
-param siteName string = 'el-nino-site-561926'
+@description('Nome do Storage Account do relatório (globalmente único)')
+param storageName string = 'elninosite561926'
 
 var logsName  = '${prefix}-logs'
 var envName   = '${prefix}-env'
@@ -288,13 +298,12 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 8501
         transport: 'auto'                    // HTTP + WebSocket
         allowInsecure: false                 // força HTTPS
-        stickySessions: { affinity: 'sticky' } // sessão Streamlit presa à réplica
       }
     }
     template: {
       scale: {
         minReplicas: 0                       // escala para zero => custo ~US$ 0
-        maxReplicas: 2
+        maxReplicas: 1                       // réplica única: sessão Streamlit consistente
         rules: [
           {
             name: 'http-concorrencia'
@@ -334,20 +343,35 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
-// ------------------------------------------- Static Web App (relatório)
-// ATENÇÃO: o plano Free do SWA só existe em regiões específicas.
-resource site 'Microsoft.Web/staticSites@2023-12-01' = {
-  name: siteName
-  location: 'eastus2'
-  sku: { name: 'Free', tier: 'Free' }
-  properties: {}
+// ---------------------------------------- Storage Account (relatório)
+// O Static Web Apps não existe em nenhuma das regiões permitidas pela política
+// da assinatura, então o relatório vai para um static website do Blob Storage.
+resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: storageName
+  location: location
+  kind: 'StorageV2'
+  sku: { name: 'Standard_LRS' }              // camada mais barata
+  properties: {
+    allowBlobPublicAccess: true              // necessário para servir o site estático
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+    accessTier: 'Hot'
+  }
 }
+
+// O static website é habilitado por CLI (az storage account blob-service-properties
+// update --enable-static-website), pois o nome das sub-propriedades varia entre
+// api-versions e o provedor rejeita a forma enviada pelo Bicep. Fica no site.yml.
 
 // ---------------------------------------------------------------- Saídas
 output agentFqdn string = agent.properties.configuration.ingress.fqdn
-output siteHostname string = site.properties.defaultHostname
+output siteUrl string = storage.properties.primaryEndpoints.web
+output storageAccountName string = storage.name
+output storageAccountId string = storage.id
 output logAnalyticsId string = logs.id
 ```
+
+> **Nota de implementação:** a sub-propriedade `staticWebsite` do `blobService` aparece com nomes diferentes conforme a `api-version` (`defaultIndexDocumentPath`/`errorDocument404Path` nas novas, `indexDocument`/`errorDocument404Path` nas antigas). Para evitar o erro `BCP037` e a rejeição do provedor, essa configuração **não** é feita no Bicep — o workflow `site.yml` a habilita via CLI a cada execução (operação idempotente).
 
 ---
 
@@ -363,6 +387,7 @@ on:
     branches: [main]
     paths:
       - 'app_el_nino.py'
+      - 'favicon.svg'
       - 'saida/facts.json'
       - 'requirements.txt'
       - 'Dockerfile'
@@ -444,6 +469,9 @@ on:
       - '.github/workflows/site.yml'
   workflow_dispatch:
 
+env:
+  STORAGE_ACCOUNT: elninosite561926
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -476,22 +504,44 @@ jobs:
           pip install -r requirements.txt
           python gerar_relatorio.py
 
-      # 3) Static Web Apps exige index.html na raiz do artefato
+      # 3) O static website exige index.html na raiz do artefato
       - name: Preparar artefato
         run: |
           mkdir -p dist
           cp relatorio_el_nino.html dist/index.html
           cp favicon.svg dist/favicon.svg
 
-      - name: Deploy no Static Web Apps
-        uses: Azure/static-web-apps-deploy@v1
-        with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_SWA_TOKEN }}
-          action: upload
-          app_location: dist
-          output_location: ''
-          skip_app_build: true
+      # 4) Habilita o static website (idempotente). O Bicep não gerencia essa
+      #    configuração porque o nome das sub-propriedades varia entre api-versions.
+      - name: Habilitar static website
+        run: |
+          az storage account blob-service-properties update \
+            --resource-group ${{ vars.AZURE_RG }} \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --enable-static-website \
+            --index-document index.html \
+            --404-document index.html
+
+      # 5) Publica no container $web, que é o root do static website
+      - name: Publicar no static website
+        run: |
+          az storage blob upload-batch \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --auth-mode login \
+            --destination '$web' \
+            --source dist \
+            --overwrite \
+            --content-cache-control 'public, max-age=300'
+
+      - name: Exibir URL pública
+        run: |
+          az storage account show \
+            --name ${{ env.STORAGE_ACCOUNT }} \
+            --resource-group ${{ vars.AZURE_RG }} \
+            --query properties.primaryEndpoints.web -o tsv
 ```
+
+> O `--auth-mode login` usa a identidade do Service Principal autenticado no job, então ele precisa do papel **Storage Blob Data Contributor** no Storage Account (ver seção 10).
 
 ---
 
@@ -502,10 +552,10 @@ jobs:
 az login
 az extension add --name containerapp --upgrade
 az provider register --namespace Microsoft.App
-az provider register --namespace Microsoft.Web
+az provider register --namespace Microsoft.Storage
 az provider register --namespace Microsoft.OperationalInsights
 
-# 1) Resource Group
+# 1) Resource Group (o RG pode ficar em qualquer região; só os recursos são restritos)
 az group create --name rg-el-nino --location eastus2
 
 # 2) Provisionar tudo (primeira vez; usa a imagem :latest do GHCR)
@@ -518,17 +568,21 @@ az deployment group create \
 az deployment group show -g rg-el-nino -n main \
   --query properties.outputs -o json
 
-# 4) Token do Static Web App -> secret AZURE_SWA_TOKEN no GitHub
-az staticwebapp secrets list \
-  --name el-nino-site-561926 --resource-group rg-el-nino \
-  --query properties.apiKey -o tsv
-
-# 5) Credencial de deploy -> secret AZURE_CREDENTIALS no GitHub
+# 4) Credencial de deploy -> secret AZURE_CREDENTIALS no GitHub.
+#    ATENÇÃO: --sdk-auth está obsoleto (emite WARNING) mas ainda é o formato
+#    consumido pelo azure/login@v2. Filtre o JSON a partir do primeiro "{".
 az ad sp create-for-rbac \
   --name gh-el-nino \
   --role contributor \
   --scopes /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/rg-el-nino \
-  --sdk-auth
+  --json-auth
+
+# 5) O site.yml publica blobs como a identidade do SP (--auth-mode login),
+#    então o papel Contributor (que é de plano de controle) NÃO basta:
+az role assignment create \
+  --assignee <CLIENT_ID_DO_SP> \
+  --role "Storage Blob Data Contributor" \
+  --scope /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/rg-el-nino/providers/Microsoft.Storage/storageAccounts/elninosite561926
 ```
 
 No GitHub, configure:
@@ -536,8 +590,7 @@ No GitHub, configure:
 | Tipo | Nome | Valor |
 |---|---|---|
 | Variable | `AZURE_RG` | `rg-el-nino` |
-| Secret | `AZURE_CREDENTIALS` | saída JSON do passo 5 |
-| Secret | `AZURE_SWA_TOKEN` | saída do passo 4 |
+| Secret | `AZURE_CREDENTIALS` | saída JSON do passo 4 (formato sdk-auth) |
 
 > A imagem no GHCR precisa estar **pública** para o Container Apps puxá-la sem credenciais. Se preferir privada, adicione `--registry-username/--registry-password` no `az containerapp update`.
 
@@ -563,7 +616,7 @@ az consumption usage list --query "[?contains(instanceName,'elnino')]"
 
 ### Domínio próprio e HTTPS
 
-- **Relatório (SWA Free):** Configure no portal → *Custom domains* (SSL gerenciado gratuito).
+- **Relatório (Blob Storage static website):** o endpoint `https://<conta>.zNN.web.core.windows.net/` já tem HTTPS. Para domínio próprio, use **Azure CDN** (ou Front Door) na frente do container `$web` — o static website em si não suporta domínio customizado diretamente. Atenção: a zona (`z15`, `z13`, ...) é atribuída pela Azure e muda por conta.
 - **Agente (Container Apps):** *Custom domains* com certificado gerenciado gratuito; aponte `app.seudominio.com` para o FQDN do agente.
 
 ### Cold start
@@ -581,14 +634,18 @@ az containerapp update -n elnino-agent -g rg-el-nino --min-replicas 0
 ## 12. Checklist de implantação
 
 - [ ] Conta Azure (Azure for Students dá US$ 100 de crédito sem cartão)
+- [ ] Confirmar que a região escolhida está entre as permitidas pela política da assinatura (`az policy assignment list` / teste com um deploy pequeno)
 - [ ] Repositório no GitHub e imagens públicas habilitadas no GHCR
 - [ ] `.gitignore` aplicado — confirmar que os CSVs **não** aparecem no `git status`
 - [ ] `Dockerfile` presente e build local validado (`docker build -t el-nino-agent .`)
 - [ ] `saida/facts.json` versionado
 - [ ] `az group create` executado
 - [ ] Deploy do Bicep executado (bootstrap)
-- [ ] Secrets/variables configurados no GitHub
+- [ ] Service Principal criado com **Contributor** (RG) **e** **Storage Blob Data Contributor** (Storage Account)
+- [ ] Secrets/variables configurados no GitHub (`AZURE_CREDENTIALS`, `AZURE_RG`)
 - [ ] Primeiro push na `main` — os dois workflows (`agent` e `site`) verdes
+- [ ] Agente com `/_stcore/health` = 200 e revisão `Healthy`
+- [ ] Blob Storage com static website habilitado (`index.html` + `favicon.svg` no `$web`)
 - [ ] Relatório abrindo e o painel do agente carregando **sem erro de CORS/iframe**
 
 ---
