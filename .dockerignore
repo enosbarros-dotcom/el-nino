@@ -1,0 +1,7 @@
+# Contexto de build enxuto: apenas o que o agente precisa em runtime.
+*
+!app_el_nino.py
+!requirements.txt
+!favicon.svg
+!saida
+saida/*.csv

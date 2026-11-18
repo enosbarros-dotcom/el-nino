@@ -1,0 +1,72 @@
+name: deploy-site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gerar_relatorio.py'
+      - 'saida/facts.json'
+      - 'favicon.svg'
+      - '.github/workflows/site.yml'
+  workflow_dispatch:
+
+env:
+  STORAGE_ACCOUNT: elninosite561926
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 1) Descobre a URL publica atual do agente
+      - name: Ler FQDN do agente
+        id: agent
+        run: |
+          FQDN=$(az containerapp show \
+            --name elnino-agent \
+            --resource-group ${{ vars.AZURE_RG }} \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "url=https://$FQDN/" >> "$GITHUB_OUTPUT"
+
+      # 2) Gera o HTML ja com o iframe apontando para o agente
+      - name: Gerar relatorio
+        env:
+          ELNINO_AGENT_URL: ${{ steps.agent.outputs.url }}
+        run: |
+          pip install -r requirements.txt
+          python gerar_relatorio.py
+
+      # 3) O static website exige index.html na raiz
+      - name: Preparar artefato
+        run: |
+          mkdir -p dist
+          cp relatorio_el_nino.html dist/index.html
+          cp favicon.svg dist/favicon.svg
+
+      # 4) O Blob Storage tambem hospeda o favicon; a flag abaixo evita erro de
+      #    content-type no SVG, que o upload-batch nao detecta sozinho.
+      - name: Publicar no static website
+        run: |
+          az storage blob upload-batch \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --auth-mode login \
+            --destination '$web' \
+            --source dist \
+            --overwrite \
+            --content-cache-control 'public, max-age=300'
+
+      - name: Exibir URL publica
+        run: |
+          az storage account show \
+            --name ${{ env.STORAGE_ACCOUNT }} \
+            --resource-group ${{ vars.AZURE_RG }} \
+            --query properties.primaryEndpoints.web -o tsv

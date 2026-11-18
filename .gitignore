@@ -1,0 +1,23 @@
+# Dados brutos do INMET (centenas de MB - nao vao para o Git)
+2024/
+2025/
+2026/
+*.zip
+
+# Artefatos locais de runtime
+*.log
+publicar.out.log
+publicar.err.log
+__pycache__/
+*.pyc
+.venv/
+.venv*/
+
+# Compartilhamento local de HTML
+.trae-html-share-packages/
+
+# Artefato gerado pelo CI (contem a URL efemera do agente)
+relatorio_el_nino.html
+
+# Documento nao relacionado ao projeto El Nino
+GS_2026_2_-_2TSCP_F_R_S_V_W_CitizenTech_resumo.docx
